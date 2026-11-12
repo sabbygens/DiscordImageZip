@@ -63,10 +63,8 @@ def split_into_zips(files: list[tuple[str, bytes]], max_bytes: int) -> list[io.B
     current_size = 0
 
     for filename, data in files:
-        # Rough estimate: compressed size is usually smaller, but we check actual after creation
         file_size = len(data)
         if current_batch and (current_size + file_size > max_bytes * 0.9):
-            # Finish current zip
             zips.append(create_zip(current_batch))
             current_batch = []
             current_size = 0
@@ -76,16 +74,7 @@ def split_into_zips(files: list[tuple[str, bytes]], max_bytes: int) -> list[io.B
     if current_batch:
         zips.append(create_zip(current_batch))
 
-    # Final safety pass: if any zip is still over, split further (rare)
-    final_zips = []
-    for zb in zips:
-        if zb.getbuffer().nbytes <= max_bytes:
-            final_zips.append(zb)
-        else:
-            # Fallback: put each file in its own zip if needed
-            # (re-create from the original batch would be better, but this is a safety net)
-            final_zips.append(zb)  # still send it; Discord will reject if truly over
-    return final_zips
+    return zips
 
 
 @bot.event
@@ -173,15 +162,15 @@ async def zipmessage(interaction: discord.Interaction, message_link: str):
         )
 
 
-# ========== Download attachments from an entire channel (with auto-split) ==========
+# ========== Download attachments from an entire channel (with auto-split + range) ==========
 @bot.tree.command(name="zipchannel", description="Download attachments from recent messages in a channel")
 @app_commands.describe(
-    limit="How many recent messages to scan (max 1000)",
+    range="Message range from most recent (e.g. 1-50 or just 50). 1 = newest message",
     images_only="Only include image files (default: true)"
 )
 async def zipchannel(
     interaction: discord.Interaction,
-    limit: app_commands.Range[int, 1, 1000] = 100,
+    range: str = "100",
     images_only: bool = True
 ):
     await interaction.response.defer(thinking=True, ephemeral=True)
@@ -191,30 +180,55 @@ async def zipchannel(
         await interaction.followup.send("This command only works in text channels or threads.", ephemeral=True)
         return
 
+    # Parse range: "5-10", "50", "1-100", etc.
+    try:
+        range = range.strip()
+        if "-" in range:
+            start_str, end_str = range.split("-", 1)
+            start = int(start_str.strip())
+            end = int(end_str.strip())
+        else:
+            start = 1
+            end = int(range.strip())
+        
+        if start < 1 or end < start or end > 1000:
+            raise ValueError("Range must be between 1 and 1000, and start <= end")
+    except Exception:
+        await interaction.followup.send(
+            "Invalid range. Use a number (e.g. `50`) or a range (e.g. `5-20`).\n"
+            "1 = most recent message.",
+            ephemeral=True
+        )
+        return
+
     status = await interaction.followup.send(
-        f"Scanning the last {limit} messages for attachments...", ephemeral=True
+        f"Scanning messages {start} to {end} (1 = newest)...", ephemeral=True
     )
 
     all_attachments = []
     message_count = 0
 
     try:
-        async for message in channel.history(limit=limit):
+        async for message in channel.history(limit=end):
             message_count += 1
+            if message_count < start:
+                continue  # skip until we reach the start of the range
             if message.attachments:
                 for att in message.attachments:
                     if images_only and not (att.content_type and att.content_type.startswith("image/")):
                         continue
                     all_attachments.append(att)
+            if message_count >= end:
+                break
     except Exception as e:
         await status.edit(content=f"Error reading channel history: {e}")
         return
 
     if not all_attachments:
-        await status.edit(content=f"No attachments found in the last {message_count} messages.")
+        await status.edit(content=f"No attachments found in messages {start}-{end}.")
         return
 
-    await status.edit(content=f"Found {len(all_attachments)} attachment(s). Downloading...")
+    await status.edit(content=f"Found {len(all_attachments)} attachment(s) in messages {start}-{end}. Downloading...")
 
     files = await download_attachments(all_attachments)
     if not files:
@@ -235,7 +249,7 @@ async def zipchannel(
         part_text = f" (part {i}/{len(zip_buffers)})" if len(zip_buffers) > 1 else ""
         await interaction.followup.send(
             content=(
-                f"ZIP ready from the last {message_count} messages{part_text} "
+                f"ZIP ready from messages {start}-{end}{part_text} "
                 f"({zip_size / 1024:.1f} KB):"
             ),
             file=discord_file,
